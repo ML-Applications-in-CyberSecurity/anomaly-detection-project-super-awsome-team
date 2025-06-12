@@ -6,8 +6,6 @@ import os
 import sys
 
 # ---- Together AI SDK import ----
-# This example assumes there is a TogetherClient in a package named 'together'.
-# Install as per Together AI docs, e.g., `pip install together-client` (check actual package name).
 try:
     from together import Together
 except ImportError:
@@ -20,10 +18,7 @@ HOST = 'localhost'
 PORT = 9999
 
 # Load the trained Isolation Forest model saved in train_model.ipynb (Step 1).
-# Determine the directory where this script resides
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-
-# Model is in src/models/anomaly_model.joblib relative to this script
 MODEL_PATH = os.path.join(BASE_DIR, "models", "anomaly_model.joblib")
 
 if not os.path.exists(MODEL_PATH):
@@ -34,15 +29,13 @@ if not os.path.exists(MODEL_PATH):
 
 model = joblib.load(MODEL_PATH)
 
-# Together AI configuration: ensure your API key is set in env var TOGETHER_API_KEY
+# Together AI configuration
 API_KEY = os.getenv("TOGETHER_API_KEY")
 if not API_KEY:
     raise ValueError("Environment variable TOGETHER_API_KEY not set. Please set it to your Together AI API key before running.")
 
 # Initialize Together client
-# Adjust initialization per the actual Together SDK; below is illustrative.
 client = Together(api_key=API_KEY)
-# Use the appropriate model name for DeepSeek LLaMA3 70B; confirm with Together docs.
 MODEL_NAME = "deepseek-ai/DeepSeek-R1-Distill-Llama-70B"  
 
 def pre_process_data(data: dict) -> pd.DataFrame:
@@ -63,7 +56,6 @@ def pre_process_data(data: dict) -> pd.DataFrame:
     if 'protocol' in df.columns:
         df['protocol_UDP'] = df['protocol'].apply(lambda x: 1 if str(x).upper() == 'UDP' else 0)
         df = df.drop(columns=['protocol'])
-    # If there are other categorical features introduced in training, handle likewise here.
 
     # Ensure the column order matches training. If during training you used columns in a specific order,
     # you may want to reorder here. E.g.:
@@ -71,7 +63,6 @@ def pre_process_data(data: dict) -> pd.DataFrame:
     # df = df[feature_columns]
     # Here we assume training used exactly these columns in this order.
     expected_cols = ['src_port', 'dst_port', 'packet_size', 'duration_ms', 'protocol_UDP']
-    # If any expected column is missing in df (unlikely for these), add with default 0
     for col in expected_cols:
         if col not in df.columns:
             df[col] = 0
