@@ -50,45 +50,44 @@ score_min = trust_params.get("score_min")
 score_max = trust_params.get("score_max")
 
 # Together AI configuration
-API_KEY = os.getenv("TOGETHER_API_KEY") or "your_api_key_here"
+API_KEY =  "20bc2f3806a1a04f8ae0d0059e91d797857b05ce4c178f3f36d1adbb083e417e"
 if not API_KEY:
     raise ValueError("Environment variable TOGETHER_API_KEY not set.")
 client = Together(api_key=API_KEY)
 MODEL_NAME = "deepseek-ai/DeepSeek-R1-Distill-Llama-70B"
 
 def pre_process_and_scale(data: dict):
-    """
-    One-hot encode protocol, scale features, return X_scaled (1D array) and trust score.
-    """
     df = pd.DataFrame([data])
-    # One-hot encode protocol to protocol_UDP
-    if 'protocol' in df.columns:
-        df['protocol_UDP'] = df['protocol'].apply(lambda x: 1 if str(x).upper() == 'UDP' else 0)
-    else:
-        df['protocol_UDP'] = 0
+    # One-hot protocol
+    proto = str(data.get('protocol','')).upper()
+    # Create columns protocol_TCP and protocol_UDP
+    df['protocol_TCP'] = 1 if proto == 'TCP' else 0
+    df['protocol_UDP'] = 1 if proto == 'UDP' else 0
+    # Drop original if exists
     df = df.drop(columns=['protocol'], errors='ignore')
-    # Ensure expected columns
-    expected = ['src_port', 'dst_port', 'packet_size', 'duration_ms', 'protocol_UDP']
-    for c in expected:
+    # Ensure other columns exist
+    for c in ['src_port','dst_port','packet_size','duration_ms']:
         if c not in df.columns:
             df[c] = 0
-    df = df[expected]
-    X = df.values  # shape (1,5)
+    df = df[['src_port','dst_port','packet_size','duration_ms','protocol_TCP','protocol_UDP']]
+    X = df.values  # shape (1,6)
     # Scale
     try:
         X_scaled = scaler.transform(X)
     except Exception as e:
         print(f"Error scaling data: {e}", file=sys.stderr)
         X_scaled = X
-    # Compute anomaly score and trust
-    score = model.decision_function(X_scaled)[0]  # higher = more normal
-    # Normalize to [0,1]
+    # Compute score and trust
+    score = model.decision_function(X_scaled)[0]
     if score_max is not None and score_min is not None and score_max > score_min:
-        trust = (score - score_min) / (score_max - score_min)
+        trust01 = (score - score_min) / (score_max - score_min)
     else:
-        trust = 0.0
-    trust = float(max(0.0, min(1.0, trust)))
-    return X_scaled, trust
+        trust01 = 0.0
+    trust01 = max(0.0, min(1.0, trust01))
+    # Scale to 0–10 if desired:
+    trust10 = trust01 * 10
+    return X_scaled, trust10
+
 
 def parse_llm_response(content: str):
     """
@@ -235,8 +234,7 @@ def main():
 
                 # Update live PCA plot on every message
                 try:
-                    # For plotting, invert scaling if desired, or plot scaled features directly
-                    df_vis = pd.DataFrame(X_all, columns=['src_port','dst_port','packet_size','duration_ms','protocol_UDP'])
+                    df_vis = pd.DataFrame(X_all, columns=['src_port','dst_port','packet_size','duration_ms','protocol_TCP','protocol_UDP'])
                     df_vis['label'] = ['Anomaly' if l == -1 else 'Normal' for l in labels_all]
                     pca = PCA(n_components=2)
                     components = pca.fit_transform(df_vis.drop(columns=['label']))
@@ -244,9 +242,9 @@ def main():
 
                     ax.clear()
                     sns.scatterplot(
-                        data=df_vis, x='PCA1', y='PCA2',
-                        hue='label', palette={'Anomaly':'red', 'Normal':'green'},
-                        ax=ax
+                    data=df_vis, x='PCA1', y='PCA2',
+                    hue='label', palette={'Anomaly':'red', 'Normal':'green'},
+                    ax=ax
                     )
                     ax.set_title("Network Traffic PCA Live Visualization")
                     ax.set_xlabel("PCA1")
