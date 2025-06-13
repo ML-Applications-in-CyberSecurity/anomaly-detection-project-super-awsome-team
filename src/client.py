@@ -4,84 +4,97 @@ import pandas as pd
 import joblib
 import os
 import sys
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.decomposition import PCA
+import csv
+from datetime import datetime
 
-# ---- Together AI SDK import ----
 try:
     from together import Together
 except ImportError:
     print("Error: Together SDK not found. Please install via 'pip install together'.", file=sys.stderr)
     raise
 
-
 # ---- Configuration ----
 HOST = 'localhost'
 PORT = 9999
-
-# Load the trained Isolation Forest model saved in train_model.ipynb (Step 1).
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_PATH = os.path.join(BASE_DIR, "models", "anomaly_model.joblib")
+SCALER_PATH = os.path.join(BASE_DIR, "models", "scaler.joblib")
+TRUST_PATH = os.path.join(BASE_DIR, "models", "trust_params.json")
+LOG_FILE = os.path.join(BASE_DIR, "anomaly_log.csv")
 
+# Initialize log file (add 'trust' column, no rating)
+if not os.path.exists(LOG_FILE):
+    with open(LOG_FILE, mode='w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            'timestamp', 'src_port', 'dst_port', 'packet_size',
+            'duration_ms', 'protocol', 'label', 'reason', 'trust'
+        ])
+
+# Load model, scaler, trust params
 if not os.path.exists(MODEL_PATH):
-    raise FileNotFoundError(
-        f"Model file not found at '{MODEL_PATH}'. "
-        "Please ensure you have run train_model.ipynb and saved the model there."
-    )
+    raise FileNotFoundError(f"Model file not found at '{MODEL_PATH}'. Please run train_model.ipynb to generate it.")
+if not os.path.exists(SCALER_PATH):
+    raise FileNotFoundError(f"Scaler file not found at '{SCALER_PATH}'. Run train_model.ipynb to generate it.")
+if not os.path.exists(TRUST_PATH):
+    raise FileNotFoundError(f"Trust params file not found at '{TRUST_PATH}'. Run train_model.ipynb to generate it.")
 
 model = joblib.load(MODEL_PATH)
+scaler = joblib.load(SCALER_PATH)
+with open(TRUST_PATH) as f:
+    trust_params = json.load(f)
+score_min = trust_params.get("score_min")
+score_max = trust_params.get("score_max")
 
 # Together AI configuration
-API_KEY = os.getenv("TOGETHER_API_KEY")
+API_KEY = os.getenv("TOGETHER_API_KEY") or "your_api_key_here"
 if not API_KEY:
-    raise ValueError("Environment variable TOGETHER_API_KEY not set. Please set it to your Together AI API key before running.")
-
-# Initialize Together client
+    raise ValueError("Environment variable TOGETHER_API_KEY not set.")
 client = Together(api_key=API_KEY)
-MODEL_NAME = "deepseek-ai/DeepSeek-R1-Distill-Llama-70B"  
+MODEL_NAME = "deepseek-ai/DeepSeek-R1-Distill-Llama-70B"
 
-def pre_process_data(data: dict) -> pd.DataFrame:
+def pre_process_and_scale(data: dict):
     """
-    Convert a single data point (dict) into a DataFrame / array for model prediction.
-    Must mirror preprocessing used during training:
-      - Numerical columns unchanged.
-      - One-hot encode 'protocol', keeping only 'protocol_UDP' to match training.
+    One-hot encode protocol, scale features, return X_scaled (1D array) and trust score.
     """
-    # Create DataFrame from single record
     df = pd.DataFrame([data])
-
-    # Example features from server: 'src_port', 'dst_port', 'packet_size', 'duration_ms', 'protocol'
-    # During training we one-hot encoded 'protocol' with drop_first=True, so only 'protocol_UDP' column was used:
-    #   protocol == 'UDP'  -> protocol_UDP = 1
-    #   protocol == 'TCP'  -> protocol_UDP = 0
-    # If other protocol values (e.g., 'UNKNOWN'), treat as not-UDP (i.e., protocol_UDP = 0).
+    # One-hot encode protocol to protocol_UDP
     if 'protocol' in df.columns:
         df['protocol_UDP'] = df['protocol'].apply(lambda x: 1 if str(x).upper() == 'UDP' else 0)
-        df = df.drop(columns=['protocol'])
-
-    # Ensure the column order matches training. If during training you used columns in a specific order,
-    # you may want to reorder here. E.g.:
-    # feature_columns = ['src_port', 'dst_port', 'packet_size', 'duration_ms', 'protocol_UDP']
-    # df = df[feature_columns]
-    # Here we assume training used exactly these columns in this order.
-    expected_cols = ['src_port', 'dst_port', 'packet_size', 'duration_ms', 'protocol_UDP']
-    for col in expected_cols:
-        if col not in df.columns:
-            df[col] = 0
-    # Select in order
-    df = df[expected_cols]
-
-    return df
+    else:
+        df['protocol_UDP'] = 0
+    df = df.drop(columns=['protocol'], errors='ignore')
+    # Ensure expected columns
+    expected = ['src_port', 'dst_port', 'packet_size', 'duration_ms', 'protocol_UDP']
+    for c in expected:
+        if c not in df.columns:
+            df[c] = 0
+    df = df[expected]
+    X = df.values  # shape (1,5)
+    # Scale
+    try:
+        X_scaled = scaler.transform(X)
+    except Exception as e:
+        print(f"Error scaling data: {e}", file=sys.stderr)
+        X_scaled = X
+    # Compute anomaly score and trust
+    score = model.decision_function(X_scaled)[0]  # higher = more normal
+    # Normalize to [0,1]
+    if score_max is not None and score_min is not None and score_max > score_min:
+        trust = (score - score_min) / (score_max - score_min)
+    else:
+        trust = 0.0
+    trust = float(max(0.0, min(1.0, trust)))
+    return X_scaled, trust
 
 def parse_llm_response(content: str):
     """
-    Parse the LLM response to extract 'Label' and 'Reason'.
-    Expects the LLM to respond with something like:
-      Label: <some label>
-      Reason: <some explanation>
-    If not found, returns the whole content as reason and empty label.
+    Only extract Label and Reason lines. Ignore any 'thinking' or extra detail.
     """
-    label = ""
-    reason = ""
-    # Split lines and search for lines starting with Label/Reason (case-insensitive)
+    label, reason = "", ""
     for line in content.splitlines():
         line_stripped = line.strip()
         if line_stripped.lower().startswith("label"):
@@ -92,72 +105,69 @@ def parse_llm_response(content: str):
             parts = line_stripped.split(":", 1)
             if len(parts) > 1:
                 reason = parts[1].strip()
+    # Fallbacks
     if not label:
-        # As fallback, take first line as label if succinct
         first_line = content.strip().splitlines()[0]
         if len(first_line) < 100:
             label = first_line.strip()
     if not reason:
-        # Fallback: use full content if no explicit Reason found
         reason = content.strip()
     return label, reason
 
 def alert_llm_for_anomaly(data: dict):
     """
-    Call the Together AI LLaMA3 70B model to get a human-readable label and reason for the anomaly.
+    Ask LLM only for Label and Reason. No rating, no step-by-step thinking.
     """
-    # Construct system and user messages. Adapt responsibly from sample prompt in spec.
     system_message = {
         "role": "system",
         "content": (
             "You are an AI assistant specialized in network anomaly detection. "
-            "Given a single network traffic data point flagged as anomalous by an automated model, "
-            "you should provide a concise Label describing the anomaly type and a Reason suggesting a possible cause."
+            "Given a JSON data point flagged as anomalous, provide **only**:\n"
+            "Label: <short description of anomaly>\n"
+            "Reason: <possible cause or explanation>\n"
+            "Respond concisely without describing your internal thought process."
         )
     }
     user_message = {
         "role": "user",
         "content": (
-            f"Network traffic reading (JSON): {json.dumps(data)}.\n"
-            "The anomaly detection model flagged this as an anomaly. "
-            "Please respond in the format:\n"
-            "Label: <short description of anomaly>\n"
-            "Reason: <possible cause or explanation>\n"
-            "Be concise and informative."
+            f"Network traffic data point: {json.dumps(data)}.\n"
+            "It was flagged as anomalous. Please respond exactly in the format:\n"
+            "Label: <...>\n"
+            "Reason: <...>"
         )
     }
-    messages = [system_message, user_message]
-
     try:
         response = client.chat.completions.create(
             model=MODEL_NAME,
-            messages=messages,
+            messages=[system_message, user_message],
             stream=False,
         )
+        content = response.choices[0].message.content
     except Exception as e:
         print(f"Error calling Together AI API: {e}", file=sys.stderr)
         return None, None
-
-    # Extract response content
-    # Depending on SDK, this may vary. Example for typical response object:
-    try:
-        content = response.choices[0].message.content
-    except Exception:
-        # Fallback: if different attribute names
-        content = getattr(response, 'text', '') or str(response)
-    label, reason = parse_llm_response(content)
-    return label, reason
+    return parse_llm_response(content)
 
 def main():
-    # Connect to server
+    # Live PCA plot setup
+    plt.ion()
+    fig, ax = plt.subplots(figsize=(10, 6))
+    ax.set_title("Network Traffic PCA Live Visualization")
+    ax.set_xlabel("PCA1")
+    ax.set_ylabel("PCA2")
+
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         try:
             s.connect((HOST, PORT))
         except ConnectionRefusedError:
-            print(f"Could not connect to server at {HOST}:{PORT}. Ensure server.py is running.", file=sys.stderr)
+            print(f"Could not connect to server at {HOST}:{PORT}.", file=sys.stderr)
             return
-        buffer = ""
+
         print(f"Client connected to server at {HOST}:{PORT}.\n")
+        buffer = ""
+        X_all, labels_all = [], []
+        anomaly_count = 0
 
         while True:
             try:
@@ -166,12 +176,10 @@ def main():
                 print(f"Socket error: {e}", file=sys.stderr)
                 break
             if not chunk:
-                # Connection closed
                 print("Server closed connection.")
                 break
             buffer += chunk
 
-            # Process line-delimited JSON messages
             while '\n' in buffer:
                 line, buffer = buffer.split('\n', 1)
                 if not line.strip():
@@ -183,30 +191,69 @@ def main():
                     continue
 
                 print(f"Data Received: {data}")
-
-                # Preprocess for model
-                df_point = pre_process_data(data)
-                # Convert to numpy array for prediction
-                X_point = df_point.values  # shape (1, n_features)
-                # Predict: 1 for normal, -1 for anomaly
+                # Preprocess, scale, compute trust
+                X_point_scaled, trust = pre_process_and_scale(data)
                 try:
-                    pred = model.predict(X_point)[0]
+                    pred = model.predict(X_point_scaled)[0]
                 except Exception as e:
                     print(f"Error during model prediction: {e}", file=sys.stderr)
                     continue
 
+                # Collect all points
+                # Note: store unscaled for plotting, trust only used for display/log
+                X_all.append(X_point_scaled[0])
+                labels_all.append(pred)
+
+                # Print prediction + trust
                 if pred == -1:
-                    # Anomaly detected
-                    print("Model prediction: Anomaly detected.")
+                    anomaly_count += 1
+                    print(f"Model prediction: Anomaly detected (trust={trust:.3f})")
                     label, reason = alert_llm_for_anomaly(data)
-                    if label is None and reason is None:
-                        print("🚨 Anomaly Detected, but failed to get LLM alert.")
+                    if label is None:
+                        print("🚨 Anomaly detected, but LLM response failed.")
+                        # Log with empty label/reason
+                        log_label, log_reason = "", ""
                     else:
-                        print(f"\n🚨 Anomaly Detected!\nLabel: {label}\nReason: {reason}\n")
-                    # Optionally, you could log anomalies to a CSV or take further action here.
+                        print(f"\n🚨 Anomaly Detected!\nLabel: {label}\nReason: {reason}\nTrust: {trust:.3f}\n")
+                        log_label, log_reason = label, reason
+                    # Log anomaly
+                    with open(LOG_FILE, mode='a', newline='') as f:
+                        writer = csv.writer(f)
+                        writer.writerow([
+                            datetime.utcnow().isoformat(),
+                            data.get('src_port', ''),
+                            data.get('dst_port', ''),
+                            data.get('packet_size', ''),
+                            data.get('duration_ms', ''),
+                            data.get('protocol', ''),
+                            log_label,
+                            log_reason,
+                            trust
+                        ])
                 else:
-                    # Normal data
-                    print("Model prediction: Normal.")
+                    print(f"Model prediction: Normal (trust={trust:.3f})")
+
+                # Update live PCA plot on every message
+                try:
+                    # For plotting, invert scaling if desired, or plot scaled features directly
+                    df_vis = pd.DataFrame(X_all, columns=['src_port','dst_port','packet_size','duration_ms','protocol_UDP'])
+                    df_vis['label'] = ['Anomaly' if l == -1 else 'Normal' for l in labels_all]
+                    pca = PCA(n_components=2)
+                    components = pca.fit_transform(df_vis.drop(columns=['label']))
+                    df_vis['PCA1'], df_vis['PCA2'] = components[:,0], components[:,1]
+
+                    ax.clear()
+                    sns.scatterplot(
+                        data=df_vis, x='PCA1', y='PCA2',
+                        hue='label', palette={'Anomaly':'red', 'Normal':'green'},
+                        ax=ax
+                    )
+                    ax.set_title("Network Traffic PCA Live Visualization")
+                    ax.set_xlabel("PCA1")
+                    ax.set_ylabel("PCA2")
+                    plt.pause(0.01)
+                except Exception as e:
+                    print(f"Error updating live plot: {e}", file=sys.stderr)
 
     print("Client exiting.")
 
