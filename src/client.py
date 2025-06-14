@@ -8,6 +8,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from sklearn.decomposition import PCA
 import csv
+import numpy as np
 from datetime import datetime
 
 try:
@@ -23,15 +24,16 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_PATH = os.path.join(BASE_DIR, "models", "anomaly_model.joblib")
 SCALER_PATH = os.path.join(BASE_DIR, "models", "scaler.joblib")
 TRUST_PATH = os.path.join(BASE_DIR, "models", "trust_params.json")
+FEATURE_COLS_PATH = os.path.join(BASE_DIR, "models", "feature_cols.json")
 LOG_FILE = os.path.join(BASE_DIR, "anomaly_log.csv")
 
-# Initialize log file (add 'trust' column, no rating)
+# Initialize log file (add 'trust' and 'confidence' columns)
 if not os.path.exists(LOG_FILE):
     with open(LOG_FILE, mode='w', newline='') as f:
         writer = csv.writer(f)
         writer.writerow([
             'timestamp', 'src_port', 'dst_port', 'packet_size',
-            'duration_ms', 'protocol', 'label', 'reason', 'trust'
+            'duration_ms', 'protocol', 'label', 'reason', 'trust', 'confidence'
         ])
 
 # Load model, scaler, trust params
@@ -41,26 +43,34 @@ if not os.path.exists(SCALER_PATH):
     raise FileNotFoundError(f"Scaler file not found at '{SCALER_PATH}'. Run train_model.ipynb to generate it.")
 if not os.path.exists(TRUST_PATH):
     raise FileNotFoundError(f"Trust params file not found at '{TRUST_PATH}'. Run train_model.ipynb to generate it.")
+if not os.path.exists(FEATURE_COLS_PATH):
+    raise FileNotFoundError(f"Feature cols file not found at '{FEATURE_COLS_PATH}'. Run train_model.ipynb to generate it.")
 
 model = joblib.load(MODEL_PATH)
 scaler = joblib.load(SCALER_PATH)
 with open(TRUST_PATH) as f:
     trust_params = json.load(f)
+# Required fields:
 score_min = trust_params.get("score_min")
 score_max = trust_params.get("score_max")
+# Load or fallback offset
+if "offset" in trust_params:
+    offset = trust_params["offset"]
+else:
+    offset = float(getattr(model, "offset_", 0.0))
+    print(f"Warning: 'offset' not in trust_params.json; using model.offset_ = {offset:.6f}")
+
+with open(FEATURE_COLS_PATH) as f:
+    feature_cols = json.load(f)
 
 # Together AI configuration
-API_KEY =  "20bc2f3806a1a04f8ae0d0059e91d797857b05ce4c178f3f36d1adbb083e417e"
+API_KEY = os.getenv("TOGETHER_API_KEY") or "your_api_key_here"
 if not API_KEY:
     raise ValueError("Environment variable TOGETHER_API_KEY not set.")
 client = Together(api_key=API_KEY)
 MODEL_NAME = "deepseek-ai/DeepSeek-R1-Distill-Llama-70B"
 
-# After loading model, scaler, trust_params:
-with open(os.path.join(BASE_DIR, "models", "feature_cols.json")) as f:
-    feature_cols = json.load(f)
-
-# Define preprocess_with_scaler and numeric_cols exactly as in training:
+# Preprocessing: same as training
 numeric_cols = ['packet_size', 'duration_ms']
 def preprocess_with_scaler(df: pd.DataFrame, scaler, feature_cols: list) -> pd.DataFrame:
     df_copy = df.copy()
@@ -95,25 +105,48 @@ def preprocess_with_scaler(df: pd.DataFrame, scaler, feature_cols: list) -> pd.D
     df_features[numeric_cols] = scaler.transform(df_features[numeric_cols])
     return df_features
 
-def pre_process_and_scale(data: dict):
+
+def compute_pred_trust_confidence(data: dict):
+    """
+    Returns (pred, score, trust10, confidence10):
+      - pred: 1 (normal) or -1 (anomaly)
+      - score: model.decision_function(X)[0]
+      - trust10 in [0,10], >0 only if anomaly, proportional to anomaly strength
+      - confidence10 in [0,10], how far from boundary (model confidence)
+    """
     df = pd.DataFrame([data])
     df_feat = preprocess_with_scaler(df, scaler, feature_cols)
-    X_scaled = df_feat.values  # shape (1, len(feature_cols))
-    # Compute trust 0–10
-    score = model.decision_function(X_scaled)[0]
+    X = df_feat.values
+    pred = model.predict(X)[0]             # 1 or -1
+    score = model.decision_function(X)[0]  # higher = more normal
+    # distance from boundary:
+    dist = score - offset  # positive -> normal side, negative -> anomaly side
+    # Normalize magnitude to [0,1]
+    if dist >= 0:
+        # normal side
+        if score_max is not None and score_max > offset:
+            norm = dist / (score_max - offset)
+        else:
+            norm = 0.0
+    else:
+        # anomaly side
+        if score_min is not None and offset > score_min:
+            norm = (-dist) / (offset - score_min)
+        else:
+            norm = 0.0
+    norm = float(np.clip(norm, 0.0, 1.0))
+    confidence10 = norm * 10
+    # trust10 only for anomaly degree:
     if score_max is not None and score_min is not None and score_max > score_min:
         trust01 = (score - score_min) / (score_max - score_min)
     else:
         trust01 = 0.0
     trust01 = max(0.0, min(1.0, trust01))
     trust10 = trust01 * 10
-    return X_scaled, trust10
+    return pred, score, trust10, confidence10
 
 
 def parse_llm_response(content: str):
-    """
-    Only extract Label and Reason lines. Ignore any 'thinking' or extra detail.
-    """
     label, reason = "", ""
     for line in content.splitlines():
         line_stripped = line.strip()
@@ -125,7 +158,6 @@ def parse_llm_response(content: str):
             parts = line_stripped.split(":", 1)
             if len(parts) > 1:
                 reason = parts[1].strip()
-    # Fallbacks
     if not label:
         first_line = content.strip().splitlines()[0]
         if len(first_line) < 100:
@@ -134,10 +166,8 @@ def parse_llm_response(content: str):
         reason = content.strip()
     return label, reason
 
+
 def alert_llm_for_anomaly(data: dict):
-    """
-    Ask LLM only for Label and Reason. No rating, no step-by-step thinking.
-    """
     system_message = {
         "role": "system",
         "content": (
@@ -168,6 +198,7 @@ def alert_llm_for_anomaly(data: dict):
         print(f"Error calling Together AI API: {e}", file=sys.stderr)
         return None, None
     return parse_llm_response(content)
+
 
 def main():
     # Live PCA plot setup
@@ -211,30 +242,22 @@ def main():
                     continue
 
                 print(f"Data Received: {data}")
-                # Preprocess, scale, compute trust
-                X_point_scaled, trust = pre_process_and_scale(data)
-                try:
-                    pred = model.predict(X_point_scaled)[0]
-                except Exception as e:
-                    print(f"Error during model prediction: {e}", file=sys.stderr)
-                    continue
+                pred, score, trust10, conf10 = compute_pred_trust_confidence(data)
 
-                # Collect all points
-                # Note: store unscaled for plotting, trust only used for display/log
-                X_all.append(X_point_scaled[0])
+                # Collect for PCA plotting: store scaled features
+                df_feat = preprocess_with_scaler(pd.DataFrame([data]), scaler, feature_cols)
+                X_all.append(df_feat.values[0])
                 labels_all.append(pred)
 
-                # Print prediction + trust
                 if pred == -1:
                     anomaly_count += 1
-                    print(f"Model prediction: Anomaly detected (trust={trust:.3f})")
+                    print(f"Model prediction: Anomaly detected (trust={trust10:.2f}/10, confidence={conf10:.2f}/10)")
                     label, reason = alert_llm_for_anomaly(data)
                     if label is None:
                         print("🚨 Anomaly detected, but LLM response failed.")
-                        # Log with empty label/reason
                         log_label, log_reason = "", ""
                     else:
-                        print(f"\n🚨 Anomaly Detected!\nLabel: {label}\nReason: {reason}\nTrust: {trust:.3f}\n")
+                        print(f"\n🚨 Anomaly Detected!\nLabel: {label}\nReason: {reason}\nTrust: {trust10:.2f}/10, Confidence: {conf10:.2f}/10\n")
                         log_label, log_reason = label, reason
                     # Log anomaly
                     with open(LOG_FILE, mode='a', newline='') as f:
@@ -248,12 +271,13 @@ def main():
                             data.get('protocol', ''),
                             log_label,
                             log_reason,
-                            trust
+                            f"{trust10:.2f}",
+                            f"{conf10:.2f}"
                         ])
                 else:
-                    print(f"Model prediction: Normal (trust={trust:.3f})")
+                     print(f"Model prediction: Normal (trust={trust10:.2f}/10, confidence={conf10:.2f}/10)")
 
-                # Update live PCA plot on every message
+                # Update live PCA plot
                 try:
                     df_vis = pd.DataFrame(X_all, columns=feature_cols)
                     df_vis['label'] = ['Anomaly' if l == -1 else 'Normal' for l in labels_all]
@@ -263,9 +287,9 @@ def main():
 
                     ax.clear()
                     sns.scatterplot(
-                    data=df_vis, x='PCA1', y='PCA2',
-                    hue='label', palette={'Anomaly':'red', 'Normal':'green'},
-                    ax=ax
+                        data=df_vis, x='PCA1', y='PCA2',
+                        hue='label', palette={'Anomaly':'red', 'Normal':'green'},
+                        ax=ax
                     )
                     ax.set_title("Network Traffic PCA Live Visualization")
                     ax.set_xlabel("PCA1")
