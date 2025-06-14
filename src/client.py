@@ -56,35 +56,56 @@ if not API_KEY:
 client = Together(api_key=API_KEY)
 MODEL_NAME = "deepseek-ai/DeepSeek-R1-Distill-Llama-70B"
 
+# After loading model, scaler, trust_params:
+with open(os.path.join(BASE_DIR, "models", "feature_cols.json")) as f:
+    feature_cols = json.load(f)
+
+# Define preprocess_with_scaler and numeric_cols exactly as in training:
+numeric_cols = ['packet_size', 'duration_ms']
+def preprocess_with_scaler(df: pd.DataFrame, scaler, feature_cols: list) -> pd.DataFrame:
+    df_copy = df.copy()
+    # Protocol one-hot
+    if 'protocol' in df_copy:
+        proto_vals = df_copy['protocol'].apply(lambda x: str(x).upper())
+        df_copy['protocol_TCP'] = proto_vals.apply(lambda x: 1 if x == 'TCP' else 0)
+        df_copy['protocol_UDP'] = proto_vals.apply(lambda x: 1 if x == 'UDP' else 0)
+    else:
+        df_copy['protocol_TCP'] = 0
+        df_copy['protocol_UDP'] = 0
+    # src_port categorical
+    COMMON_PORTS = [80, 443, 22, 8080]
+    df_copy['is_src_common'] = df_copy['src_port'].apply(lambda x: 1 if x in COMMON_PORTS else 0)
+    for p in COMMON_PORTS:
+        df_copy[f'src_{p}'] = df_copy['src_port'].apply(lambda x: 1 if x == p else 0)
+    # dst_port bins
+    df_copy['dst_low'] = df_copy['dst_port'].apply(lambda x: 1 if x < 10240 else 0)
+    df_copy['dst_mid'] = df_copy['dst_port'].apply(lambda x: 1 if 10240 <= x < 49152 else 0)
+    df_copy['dst_high'] = df_copy['dst_port'].apply(lambda x: 1 if x >= 49152 else 0)
+    df_copy['dst_suspicious'] = df_copy['dst_port'].apply(lambda x: 1 if x >= 60000 else 0)
+    # Ensure numeric exist
+    for col in numeric_cols:
+        if col not in df_copy:
+            df_copy[col] = 0
+    # Ensure all feature_cols exist
+    for col in feature_cols:
+        if col not in df_copy:
+            df_copy[col] = 0
+    df_features = df_copy[feature_cols].copy()
+    # Scale numeric cols
+    df_features[numeric_cols] = scaler.transform(df_features[numeric_cols])
+    return df_features
+
 def pre_process_and_scale(data: dict):
     df = pd.DataFrame([data])
-    # One-hot protocol
-    proto = str(data.get('protocol','')).upper()
-    # Create columns protocol_TCP and protocol_UDP
-    df['protocol_TCP'] = 1 if proto == 'TCP' else 0
-    df['protocol_UDP'] = 1 if proto == 'UDP' else 0
-    # Drop original if exists
-    df = df.drop(columns=['protocol'], errors='ignore')
-    # Ensure other columns exist
-    for c in ['src_port','dst_port','packet_size','duration_ms']:
-        if c not in df.columns:
-            df[c] = 0
-    df = df[['src_port','dst_port','packet_size','duration_ms','protocol_TCP','protocol_UDP']]
-    X = df.values  # shape (1,6)
-    # Scale
-    try:
-        X_scaled = scaler.transform(X)
-    except Exception as e:
-        print(f"Error scaling data: {e}", file=sys.stderr)
-        X_scaled = X
-    # Compute score and trust
+    df_feat = preprocess_with_scaler(df, scaler, feature_cols)
+    X_scaled = df_feat.values  # shape (1, len(feature_cols))
+    # Compute trust 0–10
     score = model.decision_function(X_scaled)[0]
     if score_max is not None and score_min is not None and score_max > score_min:
         trust01 = (score - score_min) / (score_max - score_min)
     else:
         trust01 = 0.0
     trust01 = max(0.0, min(1.0, trust01))
-    # Scale to 0–10 if desired:
     trust10 = trust01 * 10
     return X_scaled, trust10
 
@@ -234,7 +255,7 @@ def main():
 
                 # Update live PCA plot on every message
                 try:
-                    df_vis = pd.DataFrame(X_all, columns=['src_port','dst_port','packet_size','duration_ms','protocol_TCP','protocol_UDP'])
+                    df_vis = pd.DataFrame(X_all, columns=feature_cols)
                     df_vis['label'] = ['Anomaly' if l == -1 else 'Normal' for l in labels_all]
                     pca = PCA(n_components=2)
                     components = pca.fit_transform(df_vis.drop(columns=['label']))
